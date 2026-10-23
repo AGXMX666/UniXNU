@@ -105,10 +105,12 @@ jobs:
             printf '%-10s %s\n' "$tool" "$(command -v "$tool" || echo MISSING)"
           done
 
+      
       - name: Select the device
         run: |
           ./unixnu defconfig "${{ inputs.defconfig }}" -D "$GITHUB_WORKSPACE/device"
-          ./unixnu fetch xnu libplatform libdispatch AvailabilityVersions libpthread \
+          ./unixnu fetch xnu xnu-driverkit xnu-trustcache \
+                          libplatform libdispatch AvailabilityVersions libpthread \
                           corecrypto-2023 IOStorageFamily -D "$GITHUB_WORKSPACE/device"
 
       - name: Prepare inputs
