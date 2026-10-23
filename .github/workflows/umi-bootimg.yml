@@ -1,0 +1,281 @@
+name: UMI Android boot.img build
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_repository:
+        description: Device repository as owner/name
+        required: true
+        default: AGXMX666/UniXNU-umi
+      device_ref:
+        description: Device repository branch or tag
+        required: true
+        default: main
+      ipsw_url:
+        description: Target IPSW URL (empty uses board.toml)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: umi-bootimg-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+jobs:
+  build-bootimg:
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout UniXNU
+        uses: actions/checkout@v4
+
+      - name: Checkout device repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.device_repository }}
+          ref: ${{ inputs.device_ref }}
+          path: device
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      # Patch only the runner's checkout so this workflow does not require
+      # modifying the device repository or the existing macos.yml workflow.
+      - name: Add existing-payload input to UEFI builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_WORKSPACE/device/bringup/tools/build_umi_uefi.py" <<'PYTHON'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          if "def validate_ramdisk_image(path):" not in text:
+              marker = "def main():\n    parser = argparse.ArgumentParser(description=__doc__)\n"
+              if text.count(marker) != 1:
+                  raise SystemExit("Could not find build_umi_uefi.py main() insertion point")
+              helper = '''def validate_ramdisk_image(path):
+              """Validate an existing UniXNU FAT payload before embedding it as ramdisk."""
+              image = path.resolve(strict=True)
+              if not image.is_file():
+                  raise ValueError(f"RAM payload is not a file: {image}")
+              size = image.stat().st_size
+              if size < (1 << 20) or size > (128 << 20) or size % 512:
+                  raise ValueError("RAM payload must be 1 MiB..128 MiB and sector-aligned")
+              with image.open("rb") as stream:
+                  boot = stream.read(512)
+              if len(boot) != 512 or boot[510:512] != b"\\x55\\xaa":
+                  raise ValueError("RAM payload is not a FAT superfloppy boot sector")
+              if struct.unpack_from("<H", boot, 11)[0] != 512:
+                  raise ValueError("RAM payload must use 512-byte FAT sectors")
+              sectors = struct.unpack_from("<H", boot, 19)[0]
+              if sectors == 0:
+                  sectors = struct.unpack_from("<I", boot, 32)[0]
+              if sectors * 512 != size:
+                  raise ValueError("RAM payload FAT sector count differs from its file size")
+              with tempfile.TemporaryDirectory(prefix="umi-ram-payload-check-") as tmp:
+                  temp = Path(tmp)
+                  for relative in (
+                      "EFI/UniXNU/Payloads/kernel.macho",
+                      "EFI/UniXNU/Payloads/kernel.macho.adt",
+                      "EFI/UniXNU/unixnu.toml",
+                  ):
+                      destination = temp / Path(relative).name
+                      subprocess.run(
+                          ["mcopy", "-i", str(image), f"::/{relative}", str(destination)],
+                          check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      )
+                      if not destination.is_file() or destination.stat().st_size == 0:
+                          raise ValueError(f"RAM payload is missing or has an empty file: {relative}")
+                  config = (temp / "unixnu.toml").read_text(errors="replace")
+                  if 'type = "xnu"' not in config or 'path = "Payloads/kernel.macho"' not in config:
+                      raise ValueError("RAM payload menu does not identify the XNU kernel entry")
+              return image
+
+
+          '''
+              text = text.replace(marker, helper + marker, 1)
+          if "import tempfile\n" not in text:
+              text = text.replace("import sys\n", "import sys\nimport tempfile\n", 1)
+          ram_arg = '    parser.add_argument("--ramdisk-file", type=Path, help="use an existing FAT RAM payload image instead of generating a diagnostic payload")\n'
+          if "--ramdisk-file" not in text:
+              marker = '    parser.add_argument("--ram-check", choices=("payload", "memory", "payload64", "xnu", "xnu-entry", "xnu-prelink"), default="payload")\n'
+              if text.count(marker) != 1:
+                  raise SystemExit("Could not find --ram-check argument in build_umi_uefi.py")
+              text = text.replace(marker, marker + ram_arg, 1)
+          old = '    ramdisk = make_payload(diagnostic=args.ram_check) if args.payload_profile == "ram" else None\n'
+          new = '''    if args.ramdisk_file:
+                  if args.payload_profile != "ram":
+                      parser.error("--ramdisk-file requires --payload-profile ram")
+                  if args.ram_check != "payload":
+                      parser.error("--ramdisk-file uses an existing payload; leave --ram-check at its default")
+                  ramdisk = validate_ramdisk_image(args.ramdisk_file)
+              else:
+                  ramdisk = make_payload(diagnostic=args.ram_check) if args.payload_profile == "ram" else None
+          '''
+          if "if args.ramdisk_file:" not in text:
+              if text.count(old) != 1:
+                  raise SystemExit("Could not find RAM payload creation line in build_umi_uefi.py")
+              text = text.replace(old, new, 1)
+          compile(text, str(path), "exec")
+          path.write_text(text)
+          print("Patched runner-local build_umi_uefi.py to accept --ramdisk-file")
+          PYTHON
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install macOS build dependencies
+        run: |
+          brew install cmake ninja unifdef llvm mtools dtc
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+
+      - name: Select UMI device configuration
+        run: ./unixnu defconfig umi_defconfig -D "$GITHUB_WORKSPACE/device"
+
+      # Keep these revisions aligned with device/source-lock.json.
+      - name: Checkout pinned UniXNU source
+        uses: actions/checkout@v4
+        with:
+          repository: AGXMX666/UniXNU
+          ref: 7b52e7968c76453cdc18b5aa174fc368d5293b91
+          path: pinned/UniXNU
+
+      - name: Checkout pinned UEFI source
+        uses: actions/checkout@v4
+        with:
+          repository: AGXMX666/uefi-umi
+          ref: 48bc41218c480519bfd299c22205f44e418df9d0
+          path: pinned/uefi-umi
+          submodules: recursive
+
+      - name: Checkout pinned UniXNU-sheng source
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: a599a1a8a92093b5077543e071b72130769eb325
+          path: pinned/UniXNU-sheng
+
+      - name: Prepare isolated UMI workspace
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/device/bringup/setup-workspace.py" \
+            --workspace "$GITHUB_WORKSPACE/umi-work" \
+            --unixnu "$GITHUB_WORKSPACE/pinned/UniXNU" \
+            --uefi "$GITHUB_WORKSPACE/pinned/uefi-umi" \
+            --sheng "$GITHUB_WORKSPACE/pinned/UniXNU-sheng"
+
+      - name: Download UEFI firmware import and device evidence
+        env:
+          UMI_FIRMWARE_BUNDLE_URL: ${{ secrets.UMI_FIRMWARE_BUNDLE_URL }}
+          UMI_DEVICE_EVIDENCE_BUNDLE_URL: ${{ secrets.UMI_DEVICE_EVIDENCE_BUNDLE_URL }}
+        run: |
+          set -euo pipefail
+          : "${UMI_FIRMWARE_BUNDLE_URL:?Missing repository secret UMI_FIRMWARE_BUNDLE_URL}"
+          : "${UMI_DEVICE_EVIDENCE_BUNDLE_URL:?Missing repository secret UMI_DEVICE_EVIDENCE_BUNDLE_URL}"
+          case "$UMI_FIRMWARE_BUNDLE_URL" in https://*) ;; *) echo "Firmware URL must use HTTPS" >&2; exit 1 ;; esac
+          case "$UMI_DEVICE_EVIDENCE_BUNDLE_URL" in https://*) ;; *) echo "Evidence URL must use HTTPS" >&2; exit 1 ;; esac
+          curl -fLsS --retry 3 "$UMI_FIRMWARE_BUNDLE_URL" -o "$RUNNER_TEMP/umi-firmware.zip"
+          curl -fLsS --retry 3 "$UMI_DEVICE_EVIDENCE_BUNDLE_URL" -o "$RUNNER_TEMP/umi-evidence.zip"
+          mkdir -p "$RUNNER_TEMP/umi-firmware-extracted" "$RUNNER_TEMP/umi-evidence-extracted"
+          ditto -x -k "$RUNNER_TEMP/umi-firmware.zip" "$RUNNER_TEMP/umi-firmware-extracted"
+          ditto -x -k "$RUNNER_TEMP/umi-evidence.zip" "$RUNNER_TEMP/umi-evidence-extracted"
+          python3 - "$RUNNER_TEMP/umi-firmware-extracted" "$RUNNER_TEMP/umi-evidence-extracted" "$GITHUB_ENV" <<'PYTHON'
+          import sys
+          from pathlib import Path
+          firmware_search, evidence_search, github_env = map(Path, sys.argv[1:])
+          manifests = list(firmware_search.rglob("uefi-binaries/manifest.json"))
+          if len(manifests) != 1:
+              raise SystemExit("Firmware ZIP must contain exactly one uefi-binaries/manifest.json")
+          firmware_root = manifests[0].parent.parent
+          required = ("report.json", "cmdline.txt", "boot.img", "dtbo.img", "running.dtb")
+          reports = [p for p in evidence_search.rglob("report.json")
+                     if all((p.parent / name).is_file() for name in required[1:])]
+          if len(reports) != 1:
+              raise SystemExit("Evidence ZIP must contain one directory with report.json, cmdline.txt, boot.img, dtbo.img and running.dtb")
+          evidence_root = reports[0].parent
+          with github_env.open("a") as stream:
+              stream.write(f"UMI_FIRMWARE_ROOT={firmware_root}\n")
+              stream.write(f"UMI_EVIDENCE_ROOT={evidence_root}\n")
+          print("Validated UMI firmware and device-evidence ZIP layouts")
+          PYTHON
+
+      - name: Build UMI XNU kernel
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/umi-work"
+          python3 tools/build_umi_xnu.py --stage all --profile phone -j 6
+
+      - name: Prelink UMI kernel
+        env:
+          IPSW_URL: ${{ inputs.ipsw_url }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/umi-work"
+          args=()
+          if [ -n "$IPSW_URL" ]; then args+=(--ipsw "$IPSW_URL"); fi
+          ./sources/UniXNU/unixnu build prelink \
+            -D "$GITHUB_WORKSPACE/umi-work/devices/umi" \
+            --out "$GITHUB_WORKSPACE/umi-work/out/umi-xnu" \
+            "${args[@]}"
+
+      - name: Build FAT payload image
+        env:
+          UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          UMI_KERNEL: ${{ github.workspace }}/umi-work/out/umi-xnu/umi/kernel/kernel.macho
+        run: |
+          set -euo pipefail
+          : "${UNIQUE_CHIP_ID:?Missing repository secret UNIXNU_UNIQUE_CHIP_ID}"
+          test -s "$UMI_KERNEL"
+          ./unixnu build payload --unique-chip-id "$UNIQUE_CHIP_ID" --kernel "$UMI_KERNEL"
+          test -s "$GITHUB_WORKSPACE/out/umi/payload/payload.img"
+
+      - name: Build UEFI firmware and Android boot.img
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/umi-work"
+          python3 tools/build_umi_uefi.py \
+            --firmware "$UMI_FIRMWARE_ROOT" \
+            --evidence "$UMI_EVIDENCE_ROOT" \
+            --display-profile inherited \
+            --input-profile buttons \
+            --payload-profile ram \
+            --loader-profile darwinboot \
+            --ramdisk-file "$GITHUB_WORKSPACE/out/umi/payload/payload.img" \
+            -j 6
+          test -s "$GITHUB_WORKSPACE/umi-work/out/umi/boot/umi-uefi-menu.img"
+
+      - name: Upload Android boot image and build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: umi-android-bootimg
+          path: |
+            umi-work/out/umi/boot/umi-uefi-menu.img
+            umi-work/out/umi/boot/boot.json
+            umi-work/out/umi/dtb/**
+            umi-work/out/umi/prepare.json
+            umi-work/out/umi/firmware-build.json
+            umi-work/out/umi-xnu/umi/kernel/**
+            umi-work/out/umi-xnu/umi/logs/**
+            umi-work/out/unixnu/logs/**
+            out/umi/payload/**
+            out/umi/logs/**
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove downloaded proprietary inputs
+        if: always()
+        run: |
+          rm -rf out/ipsw out/feeds out/umi/tree/.cache/firmware
+          rm -f "$RUNNER_TEMP/umi-firmware.zip" "$RUNNER_TEMP/umi-evidence.zip"
+          rm -rf "$RUNNER_TEMP/umi-firmware-extracted" "$RUNNER_TEMP/umi-evidence-extracted"
+          rm -rf umi-work/out/umi-xnu/ipsw \
+                 umi-work/out/umi-xnu/feeds \
+                 umi-work/out/umi-xnu/umi/tree/.cache/firmware
