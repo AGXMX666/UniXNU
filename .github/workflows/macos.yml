@@ -28,7 +28,7 @@ on:
         required: false
         default: ""
       pre_build:
-        description: Optional shell commands run in the UniXNU checkout before the kernel build
+        description: Optional shell commands run in the pinned UniXNU checkout before the kernel build
         required: false
         default: ""
       trust_cache_url:
@@ -105,11 +105,12 @@ jobs:
             printf '%-10s %s\n' "$tool" "$(command -v "$tool" || echo MISSING)"
           done
 
-        
+      # Keep this step for the generic userdata/payload commands that use the root checkout.
       - name: Select the device
         run: |
           ./unixnu defconfig "${{ inputs.defconfig }}" -D "$GITHUB_WORKSPACE/device"
 
+      # These revisions are taken from device/source-lock.json. Do not replace them with main.
       - uses: actions/checkout@v4
         with:
           repository: AGXMX666/UniXNU
@@ -127,7 +128,16 @@ jobs:
           repository: UniXNU/UniXNU-sheng
           ref: a599a1a8a92093b5077543e071b72130769eb325
           path: pinned/UniXNU-sheng
-          
+
+      # IMPORTANT: create umi-work before any step tries to cd into it.
+      - name: Prepare UMI workspace
+        run: |
+          python3 "$GITHUB_WORKSPACE/device/bringup/setup-workspace.py" \
+            --workspace "$GITHUB_WORKSPACE/umi-work" \
+            --unixnu "$GITHUB_WORKSPACE/pinned/UniXNU" \
+            --uefi "$GITHUB_WORKSPACE/pinned/uefi-umi" \
+            --sheng "$GITHUB_WORKSPACE/pinned/UniXNU-sheng"
+
       - name: Prepare inputs
         env:
           TRUST_CACHE_URL: ${{ inputs.trust_cache_url }}
@@ -135,6 +145,7 @@ jobs:
           GROW_GIB: ${{ inputs.grow_gib }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
         run: |
+          set -euo pipefail
           if [ -n "$TRUST_CACHE_URL" ]; then
             curl -fL "$TRUST_CACHE_URL" -o "$RUNNER_TEMP/trustcache"
           fi
@@ -157,52 +168,45 @@ jobs:
         if: inputs.pre_build != ''
         env:
           PRE_BUILD: ${{ inputs.pre_build }}
-          DEVICE_DIR: ${{ github.workspace }}/device
-        run: bash -euo pipefail -c "$PRE_BUILD"
+          DEVICE_DIR: ${{ github.workspace }}/umi-work/devices/umi
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/pinned/UniXNU"
+          bash -euo pipefail -c "$PRE_BUILD"
 
-
-      
       - name: Build UMI source kernel and support libraries
+        if: contains(inputs.steps, 'kernel')
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/umi-work"
-
           python3 tools/build_umi_xnu.py \
             --stage all \
             --profile phone \
             -j 6
 
       - name: Prelink UMI kernel
+        if: contains(inputs.steps, 'kernel')
         env:
           IPSW_URL: ${{ inputs.ipsw_url }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/umi-work"
-
           args=()
           if [ -n "$IPSW_URL" ]; then
             args+=(--ipsw "$IPSW_URL")
           fi
-
           ./sources/UniXNU/unixnu build prelink \
             -D "$GITHUB_WORKSPACE/umi-work/devices/umi" \
             --out "$GITHUB_WORKSPACE/umi-work/out/umi-xnu" \
             "${args[@]}"
 
-          
-      - name: Prepare UMI workspace
-        run: |
-          python3 "$GITHUB_WORKSPACE/device/bringup/setup-workspace.py" \
-            --workspace "$GITHUB_WORKSPACE/umi-work" \
-            --unixnu "$GITHUB_WORKSPACE/pinned/UniXNU" \
-            --uefi "$GITHUB_WORKSPACE/pinned/uefi-umi" \
-            --sheng "$GITHUB_WORKSPACE/pinned/UniXNU-sheng"
-
+      # This legacy userdata image is an independent output; it is not the optional APFS Data seed above.
       - name: Build userdata
         if: contains(inputs.steps, 'userdata')
         env:
           IPSW_URL: ${{ inputs.ipsw_url }}
         run: |
+          set -euo pipefail
           args=()
           if [ -n "$IPSW_URL" ]; then args+=(--ipsw "$IPSW_URL"); fi
           ./unixnu build userdata "${args[@]}"
@@ -215,6 +219,7 @@ jobs:
           UMI_KERNEL: ${{ github.workspace }}/umi-work/out/umi-xnu/umi/kernel/kernel.macho
           OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
         run: |
+          set -euo pipefail
           args=()
           if [ -f "$RUNNER_TEMP/trustcache" ]; then
             if [ "$OWNER_TRUST_CACHE" = "true" ]; then
@@ -242,6 +247,7 @@ jobs:
             out/*/payload/**
             out/*/logs/**
             umi-work/out/umi-xnu/umi/kernel/**
+            umi-work/out/umi-xnu/umi/payload/**
             umi-work/out/umi-xnu/umi/logs/**
           if-no-files-found: error
           retention-days: 7
