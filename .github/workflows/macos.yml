@@ -229,7 +229,8 @@ jobs:
             fi
           fi
           if [ -f "$RUNNER_TEMP/data.dbr" ]; then args+=(--data-ramdisk "$RUNNER_TEMP/data.dbr"); fi
-          if [ -n "$UNIQUE_CHIP_ID" ]; then args+=(--unique-chip-id "$UNIQUE_CHIP_ID"); fi
+          : "${UNIQUE_CHIP_ID:?Missing required GitHub Actions secret UNIXNU_UNIQUE_CHIP_ID}"
+          args+=(--unique-chip-id "$UNIQUE_CHIP_ID")
           if [ "$SKIP_SETUP" = "true" ]; then args+=(--skip-setup); fi
           if [ ! -f "$UMI_KERNEL" ]; then
             echo "Missing prelinked UMI kernel: $UMI_KERNEL" >&2
