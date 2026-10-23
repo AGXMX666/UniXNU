@@ -73,7 +73,7 @@ def need_uefi(ctx):
     return uefi
 
 
-REFERENCES = {'kernel': ('xnu', 'libplatform', 'libdispatch', 'AvailabilityVersions', 'libpthread', 'corecrypto-2023', 'IOStorageFamily'), 'package': ('edk2',), 'firmware': ('edk2',)}
+REFERENCES = {'kernel': ('xnu', 'xnu-driverkit','xnu-trustcache','libplatform', 'libdispatch', 'AvailabilityVersions', 'libpthread', 'corecrypto-2023', 'IOStorageFamily'), 'package': ('edk2',), 'firmware': ('edk2',)}
 
 
 def prepare(ctx, steps=()):
