@@ -6,7 +6,7 @@ on:
       device_repository:
         description: Device repository as owner/name
         required: true
-        default: AGXMX666/uefi-umi
+        default: AGXMX666/UniXNU-umi
       device_ref:
         description: Device repository ref
         required: true
