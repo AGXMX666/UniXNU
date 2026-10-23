@@ -105,14 +105,29 @@ jobs:
             printf '%-10s %s\n' "$tool" "$(command -v "$tool" || echo MISSING)"
           done
 
-      
+        
       - name: Select the device
         run: |
           ./unixnu defconfig "${{ inputs.defconfig }}" -D "$GITHUB_WORKSPACE/device"
-          ./unixnu fetch xnu xnu-driverkit xnu-trustcache \
-                          libplatform libdispatch AvailabilityVersions libpthread \
-                          corecrypto-2023 IOStorageFamily -D "$GITHUB_WORKSPACE/device"
 
+      - uses: actions/checkout@v4
+        with:
+          repository: AGXMX666/UniXNU
+          ref: 7b52e7968c76453cdc18b5aa174fc368d5293b91
+          path: pinned/UniXNU
+
+      - uses: actions/checkout@v4
+        with:
+          repository: AGXMX666/uefi-umi
+          ref: 48bc41218c480519bfd299c22205f44e418df9d0
+          path: pinned/uefi-umi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: a599a1a8a92093b5077543e071b72130769eb325
+          path: pinned/UniXNU-sheng
+          
       - name: Prepare inputs
         env:
           TRUST_CACHE_URL: ${{ inputs.trust_cache_url }}
@@ -145,13 +160,43 @@ jobs:
           DEVICE_DIR: ${{ github.workspace }}/device
         run: bash -euo pipefail -c "$PRE_BUILD"
 
-      - name: Build kernel
+
+      
+      - name: Build UMI source kernel and support libraries
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/umi-work"
+
+          python3 tools/build_umi_xnu.py \
+            --stage all \
+            --profile phone \
+            -j 6
+
+      - name: Prelink UMI kernel
         env:
           IPSW_URL: ${{ inputs.ipsw_url }}
         run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/umi-work"
+
           args=()
-          if [ -n "$IPSW_URL" ]; then args+=(--ipsw "$IPSW_URL"); fi
-          ./unixnu build kernel "${args[@]}"
+          if [ -n "$IPSW_URL" ]; then
+            args+=(--ipsw "$IPSW_URL")
+          fi
+
+          ./sources/UniXNU/unixnu build prelink \
+            -D "$GITHUB_WORKSPACE/umi-work/devices/umi" \
+            --out "$GITHUB_WORKSPACE/umi-work/out/umi-xnu" \
+            "${args[@]}"
+
+          
+      - name: Prepare UMI workspace
+        run: |
+          python3 "$GITHUB_WORKSPACE/device/bringup/setup-workspace.py" \
+            --workspace "$GITHUB_WORKSPACE/umi-work" \
+            --unixnu "$GITHUB_WORKSPACE/pinned/UniXNU" \
+            --uefi "$GITHUB_WORKSPACE/pinned/uefi-umi" \
+            --sheng "$GITHUB_WORKSPACE/pinned/UniXNU-sheng"
 
       - name: Build userdata
         if: contains(inputs.steps, 'userdata')
@@ -167,6 +212,7 @@ jobs:
         env:
           UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
+          UMI_KERNEL: ${{ github.workspace }}/umi-work/out/umi-xnu/umi/kernel/kernel.macho
           OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
         run: |
           args=()
@@ -180,6 +226,11 @@ jobs:
           if [ -f "$RUNNER_TEMP/data.dbr" ]; then args+=(--data-ramdisk "$RUNNER_TEMP/data.dbr"); fi
           if [ -n "$UNIQUE_CHIP_ID" ]; then args+=(--unique-chip-id "$UNIQUE_CHIP_ID"); fi
           if [ "$SKIP_SETUP" = "true" ]; then args+=(--skip-setup); fi
+          if [ ! -f "$UMI_KERNEL" ]; then
+            echo "Missing prelinked UMI kernel: $UMI_KERNEL" >&2
+            exit 1
+          fi
+          args+=(--kernel "$UMI_KERNEL")
           ./unixnu build payload "${args[@]}"
 
       - name: Upload kernel and payload
@@ -190,6 +241,8 @@ jobs:
             out/*/kernel/**
             out/*/payload/**
             out/*/logs/**
+            umi-work/out/umi-xnu/umi/kernel/**
+            umi-work/out/umi-xnu/umi/logs/**
           if-no-files-found: error
           retention-days: 7
 
@@ -207,3 +260,6 @@ jobs:
         run: |
           rm -rf out/ipsw out/feeds device/.cache/firmware out/*/tree/.cache/firmware
           rm -f "$RUNNER_TEMP/trustcache" "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr"
+          rm -rf umi-work/out/umi-xnu/ipsw \
+                 umi-work/out/umi-xnu/feeds \
+                 umi-work/out/umi-xnu/umi/tree/.cache/firmware
