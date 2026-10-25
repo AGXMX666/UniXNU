@@ -58,6 +58,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: macos-build-${{ github.ref }}
@@ -137,6 +138,17 @@ jobs:
             --unixnu "$GITHUB_WORKSPACE/pinned/UniXNU" \
             --uefi "$GITHUB_WORKSPACE/pinned/uefi-umi" \
             --sheng "$GITHUB_WORKSPACE/pinned/UniXNU-sheng"
+
+      # Keep the exact Data seed already initialized on the phone.
+      - name: Restore retained umi Data seed
+        if: contains(inputs.steps, 'kernel')
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: AGXMX666/UniXNU
+          run-id: 40167145760
+          name: unixnu-umi_defconfig
+          path: retained-data19
 
       - name: Prepare inputs
         env:
