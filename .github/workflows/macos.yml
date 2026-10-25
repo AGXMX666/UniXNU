@@ -251,6 +251,17 @@ jobs:
           args+=(--kernel "$UMI_KERNEL")
           ./unixnu build payload "${args[@]}"
 
+      - name: Upload failed UMI build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: umi-failed-build-logs-${{ github.run_id }}
+          path: |
+            umi-work/out/umi-xnu/umi/logs/**
+            out/*/logs/**
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Upload kernel and payload
         uses: actions/upload-artifact@v4
         with:
